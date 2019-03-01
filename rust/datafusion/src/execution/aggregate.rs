@@ -19,6 +19,7 @@
 //! functions with optional GROUP BY columns
 
 use std::cell::RefCell;
+use std::convert::TryFrom;
 use std::rc::Rc;
 use std::str;
 use std::sync::Arc;
@@ -226,6 +227,67 @@ impl AggregateFunction for MaxFunction {
 }
 
 #[derive(Debug)]
+struct CountFunction {
+    value: Option<ScalarValue>,
+}
+
+impl CountFunction {
+    fn new() -> Self {
+        Self { value: None }
+    }
+}
+
+impl AggregateFunction for CountFunction {
+    fn name(&self) -> &str {
+        "count"
+    }
+
+    fn accumulate_scalar(&mut self, value: &Option<ScalarValue>) {
+        if self.value.is_none() {
+            self.value = value.clone();
+        } else if value.is_some() {
+            self.value = match (&self.value, value) {
+                (Some(ScalarValue::UInt8(a)), Some(ScalarValue::UInt8(b))) => {
+                    Some(ScalarValue::UInt8(*a + b))
+                }
+                (Some(ScalarValue::UInt16(a)), Some(ScalarValue::UInt16(b))) => {
+                    Some(ScalarValue::UInt16(*a + b))
+                }
+                (Some(ScalarValue::UInt32(a)), Some(ScalarValue::UInt32(b))) => {
+                    Some(ScalarValue::UInt32(*a + b))
+                }
+                (Some(ScalarValue::UInt64(a)), Some(ScalarValue::UInt64(b))) => {
+                    Some(ScalarValue::UInt64(*a + b))
+                }
+                _ => panic!("unsupported data type for COUNT"),
+            }
+        }
+    }
+
+    fn result(&self) -> &Option<ScalarValue> {
+        &self.value
+    }
+
+    fn data_type(&self) -> &DataType {
+        match &self.value {
+            Some(ScalarValue::UInt8(_)) => {
+                return &DataType::UInt8;
+            }
+            Some(ScalarValue::UInt16(_)) => {
+                return &DataType::UInt16;
+            }
+            Some(ScalarValue::UInt32(_)) => {
+                return &DataType::UInt32;
+            }
+            Some(ScalarValue::UInt64(_)) => {
+                return &DataType::UInt64;
+            }
+            _ => &DataType::UInt64,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct SumFunction {
     data_type: DataType,
     value: Option<ScalarValue>,
@@ -329,6 +391,8 @@ fn create_accumulators(aggr_expr: &Vec<RuntimeExpr>) -> Result<AccumulatorSet> {
                 AggregateType::Max => Ok(Rc::new(RefCell::new(MaxFunction::new(t)))
                     as Rc<RefCell<AggregateFunction>>),
                 AggregateType::Sum => Ok(Rc::new(RefCell::new(SumFunction::new(t)))
+                    as Rc<RefCell<AggregateFunction>>),
+                AggregateType::Count => Ok(Rc::new(RefCell::new(CountFunction::new()))
                     as Rc<RefCell<AggregateFunction>>),
                 _ => Err(ExecutionError::ExecutionError(
                     "unsupported aggregate function".to_string(),
@@ -547,6 +611,26 @@ fn array_sum(array: ArrayRef, dt: &DataType) -> Result<Option<ScalarValue>> {
     }
 }
 
+fn array_count(array: ArrayRef) -> Result<Option<ScalarValue>> {
+    let non_null_count = array.len() - array.null_count();
+    if non_null_count == 0 {
+        return Ok(None);
+    }
+    if let Ok(value) = u64::try_from(non_null_count) {
+        return Ok(Some(ScalarValue::UInt64(value)));
+    } else if let Ok(value) = u32::try_from(non_null_count) {
+        return Ok(Some(ScalarValue::UInt32(value)));
+    } else if let Ok(value) = u16::try_from(non_null_count) {
+        return Ok(Some(ScalarValue::UInt16(value)));
+    } else if let Ok(value) = u8::try_from(non_null_count) {
+        return Ok(Some(ScalarValue::UInt8(value)));
+    } else {
+        return Err(ExecutionError::ExecutionError(
+            "Could not compute count".to_string(),
+        ));
+    }
+}
+
 fn update_accumulators(
     batch: &RecordBatch,
     row: usize,
@@ -734,6 +818,8 @@ impl AggregateRelation {
                                     .accumulate_scalar(i, array_max(array, &t)?),
                                 AggregateType::Sum => accumulator_set
                                     .accumulate_scalar(i, array_sum(array, &t)?),
+                                AggregateType::Count => accumulator_set
+                                    .accumulate_scalar(i, array_count(array)?),
                                 _ => {
                                     return Err(ExecutionError::NotImplemented(
                                         "Unsupported aggregate function".to_string(),
@@ -1021,6 +1107,7 @@ mod tests {
     use super::super::relation::DataSourceRelation;
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+    use std::collections::HashMap;
 
     #[test]
     fn min_f64_group_by_string() {
@@ -1055,6 +1142,129 @@ mod tests {
             .downcast_ref::<Float64Array>()
             .unwrap();
         assert_eq!(0.01479305307777301, min_lat.value(0));
+    }
+
+    #[test]
+    fn count_one() {
+        let schema = aggr_test_schema();
+        let relation = load_csv("../../testing/data/csv/aggregate_test_100.csv", &schema);
+        let context = ExecutionContext::new();
+
+        let aggr_expr = vec![expression::compile_expr(
+            &context,
+            &Expr::AggregateFunction {
+                name: String::from("count"),
+                args: vec![Expr::Literal(ScalarValue::UInt64(1))],
+                return_type: DataType::UInt64,
+            },
+            &schema,
+        )
+        .unwrap()];
+
+        let aggr_schema = Arc::new(Schema::new(vec![Field::new(
+            "count",
+            DataType::UInt64,
+            true,
+        )]));
+
+        let mut projection =
+            AggregateRelation::new(aggr_schema, relation, vec![], aggr_expr);
+        let batch = projection.next().unwrap().unwrap();
+        assert_eq!(1, batch.num_columns());
+        let count_value = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(1, count_value.len());
+        assert_eq!(100, count_value.value(0));
+    }
+
+    #[test]
+    fn count_one_group_by_column() {
+        let schema = aggr_test_schema();
+        let relation = load_csv("../../testing/data/csv/aggregate_test_100.csv", &schema);
+        let context = ExecutionContext::new();
+
+        let group_by_expr =
+            vec![expression::compile_expr(&context, &Expr::Column(1), &schema).unwrap()];
+
+        let aggr_expr = vec![expression::compile_expr(
+            &context,
+            &Expr::AggregateFunction {
+                name: String::from("count"),
+                args: vec![Expr::Literal(ScalarValue::UInt64(1))],
+                return_type: DataType::UInt64,
+            },
+            &schema,
+        )
+        .unwrap()];
+
+        let aggr_schema = Arc::new(Schema::new(vec![
+            Field::new("c2", DataType::UInt32, false),
+            Field::new("count", DataType::UInt64, true),
+        ]));
+
+        let mut projection =
+            AggregateRelation::new(aggr_schema, relation, group_by_expr, aggr_expr);
+        let batch = projection.next().unwrap().unwrap();
+        assert_eq!(2, batch.num_columns());
+        assert_eq!(5, batch.num_rows());
+        let c2_values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let count_values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let mut count_map = HashMap::new();
+        for i in 0..5 {
+            count_map.insert(c2_values.value(i), count_values.value(i));
+        }
+        assert_eq!(22, count_map[&1]);
+        assert_eq!(22, count_map[&2]);
+        assert_eq!(19, count_map[&3]);
+        assert_eq!(23, count_map[&4]);
+        assert_eq!(14, count_map[&5]);
+    }
+
+    #[test]
+    fn count_column() {
+        let schema = aggr_test_schema();
+        let relation = load_csv("../../testing/data/csv/aggregate_test_100.csv", &schema);
+        let context = ExecutionContext::new();
+
+        let aggr_expr = vec![expression::compile_expr(
+            &context,
+            &Expr::AggregateFunction {
+                name: String::from("count"),
+                args: vec![Expr::Column(0)],
+                return_type: DataType::UInt64,
+            },
+            &schema,
+        )
+        .unwrap()];
+
+        let aggr_schema = Arc::new(Schema::new(vec![Field::new(
+            "count",
+            DataType::UInt64,
+            true,
+        )]));
+
+        let mut projection =
+            AggregateRelation::new(aggr_schema, relation, vec![], aggr_expr);
+        let batch = projection.next().unwrap().unwrap();
+        assert_eq!(1, batch.num_columns());
+        assert_eq!(1, batch.num_rows());
+        let count_value = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(100, count_value.value(0));
     }
 
     #[test]
